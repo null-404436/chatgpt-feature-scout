@@ -1,0 +1,40 @@
+name: Daily Feature Scout
+
+on:
+  schedule:
+    # GitHub Actions uses UTC. Runs daily at 08:00 UTC (09:00 UK in summer).
+    - cron: "0 8 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  scout:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run Feature Scout
+        env:
+          DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
+          DISCORD_USER_ID: ${{ secrets.DISCORD_USER_ID }}
+          MAX_ITEMS: "8"
+          LOOKBACK_HOURS: "72"
+        run: python scout.py
+
+      - name: Save seen announcements
+        run: |
+          if ! git diff --quiet -- seen.json; then
+            git config user.name "feature-scout-bot"
+            git config user.email "feature-scout-bot@users.noreply.github.com"
+            git add seen.json
+            git commit -m "Update Feature Scout seen items"
+            git push
+          fi
