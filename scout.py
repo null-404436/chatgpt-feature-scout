@@ -1,231 +1,260 @@
-#!/usr/bin/env python3
-"""ChatGPT Feature Scout: collect recent AI announcements and DM a Discord user."""
 
 import json
 import os
-import re
 import sys
 import urllib.error
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone, timedelta
 from email.utils import parsedate_to_datetime
-from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent
-SEEN_FILE = ROOT / "seen.json"
+BOT_TOKEN = os.environ.get("DISCORD_BOT_TOKEN", "").strip()
+USER_ID = os.environ.get("DISCORD_USER_ID", "").strip()
+MAX_ITEMS = int(os.environ.get("MAX_ITEMS", "8"))
+LOOKBACK_HOURS = int(os.environ.get("LOOKBACK_HOURS", "72"))
+
+SEEN_FILE = "seen.json"
 
 FEEDS = [
     ("OpenAI", "https://openai.com/news/rss.xml"),
-    ("Anthropic", "https://www.anthropic.com/news/rss.xml"),
-    ("Google AI Blog", "https://blog.research.google/feeds/posts/default?alt=rss"),
+    ("Google AI", "https://blog.google/technology/ai/rss/"),
     ("Hugging Face", "https://huggingface.co/blog/feed.xml"),
 ]
 
-INTEREST_WORDS = re.compile(
-    r"\b(new|launch|introduc|release|available|rollout|update|model|chatgpt|"
-    r"agent|image|video|voice|audio|reason|coding|developer|tool|assistant|"
-    r"open.?source|ai|artificial intelligence|api|robot|research|benchmark|"
-    r"generat|vision|multimodal|automation|feature|capabilit)\w*\b",
-    re.IGNORECASE,
+USER_AGENT = (
+    "Mozilla/5.0 (compatible; FeatureScout/1.0; "
+    "+https://github.com/null-404436/chatgpt-feature-scout)"
 )
-MAX_ITEMS = int(os.getenv("MAX_ITEMS", "8"))
-LOOKBACK_HOURS = int(os.getenv("LOOKBACK_HOURS", "72"))
+
+DISCORD_AGENT = (
+    "DiscordBot "
+    "(https://github.com/null-404436/chatgpt-feature-scout, 1.0)"
+)
 
 
-def http_get(url, headers=None):
-    request = urllib.request.Request(
-        url,
-        headers={"User-Agent": "ChatGPT-Feature-Scout/1.0 (+personal hobby project)", **(headers or {})},
-    )
-    with urllib.request.urlopen(request, timeout=25) as response:
+def fetch_url(url, headers=None):
+    request_headers = {"User-Agent": USER_AGENT}
+    if headers:
+        request_headers.update(headers)
+
+    request = urllib.request.Request(url, headers=request_headers)
+
+    with urllib.request.urlopen(request, timeout=20) as response:
         return response.read()
+
+
+def load_seen():
+    try:
+        with open(SEEN_FILE, "r", encoding="utf-8") as file:
+            data = json.load(file)
+            return set(data) if isinstance(data, list) else set()
+    except (FileNotFoundError, json.JSONDecodeError):
+        return set()
+
+
+def save_seen(seen):
+    with open(SEEN_FILE, "w", encoding="utf-8") as file:
+        json.dump(sorted(seen), file, indent=2)
+
+
+def child_text(element, names):
+    for name in names:
+        found = element.find(name)
+        if found is not None and found.text:
+            return found.text.strip()
+    return ""
 
 
 def parse_date(value):
     if not value:
         return None
-    value = value.strip()
+
     try:
-        dt = parsedate_to_datetime(value)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt.astimezone(timezone.utc)
-    except Exception:
+        date = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if date.tzinfo is None:
+            date = date.replace(tzinfo=timezone.utc)
+        return date.astimezone(timezone.utc)
+    except ValueError:
         pass
+
     try:
-        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt.astimezone(timezone.utc)
-    except Exception:
+        date = parsedate_to_datetime(value)
+        if date.tzinfo is None:
+            date = date.replace(tzinfo=timezone.utc)
+        return date.astimezone(timezone.utc)
+    except (ValueError, TypeError, OverflowError):
         return None
 
 
-def local_name(tag):
-    return tag.rsplit("}", 1)[-1].lower()
+def parse_feed(source, content):
+    root = ET.fromstring(content)
+    entries = []
 
-
-def child_text(element, names):
-    for child in list(element):
-        if local_name(child.tag) in names:
-            text = "".join(child.itertext()).strip()
-            if text:
-                return text
-    return ""
-
-
-def item_link(item):
-    for child in list(item):
-        if local_name(child.tag) == "link":
-            href = child.attrib.get("href")
-            if href:
-                return href.strip()
-            if child.text and child.text.strip():
-                return child.text.strip()
-        if local_name(child.tag) == "guid" and child.text:
-            value = child.text.strip()
-            if value.startswith("http"):
-                return value
-    return ""
-
-
-def parse_feed(source, url):
-    try:
-        data = http_get(url)
-        root = ET.fromstring(data)
-    except Exception as exc:
-        print(f"[WARN] Could not read {source} feed: {exc}")
-        return []
-
-    found = []
-    for item in root.iter():
-        if local_name(item.tag) not in {"item", "entry"}:
+    # Supports RSS and Atom feeds.
+    for entry in root.iter():
+        tag = entry.tag.split("}")[-1].lower()
+        if tag not in ("item", "entry"):
             continue
-        title = child_text(item, {"title"}) or "Untitled announcement"
-        link = item_link(item)
-        summary = child_text(item, {"description", "summary", "content", "encoded"})
-        date_text = child_text(item, {"pubdate", "published", "updated", "date", "issued"})
-        published = parse_date(date_text)
-        # If an item has no date, skip it rather than guessing.
-        if not link or not published:
+
+        title = child_text(entry, ["title", "{*}title"])
+        link = child_text(entry, ["link", "{*}link"])
+
+        if not link:
+            for item in entry:
+                if item.tag.split("}")[-1].lower() == "link":
+                    link = item.attrib.get("href", "")
+                    if link:
+                        break
+
+        published = (
+            child_text(entry, [
+                "pubDate", "published", "updated",
+                "{*}pubDate", "{*}published", "{*}updated"
+            ])
+        )
+
+        if not title or not link:
             continue
-        plain_summary = re.sub(r"<[^>]+>", " ", summary)
-        plain_summary = re.sub(r"\s+", " ", plain_summary).strip()
-        found.append({
+
+        entries.append({
             "source": source,
-            "title": re.sub(r"\s+", " ", title).strip(),
+            "title": title,
             "link": link,
-            "summary": plain_summary[:500],
-            "published": published.isoformat(),
+            "published": parse_date(published),
         })
-    # A feed can sometimes expose duplicate entries; de-duplicate by URL.
-    unique = {}
-    for item in found:
-        unique[item["link"]] = item
-    return list(unique.values())
+
+    return entries
 
 
-def load_seen():
-    try:
-        return json.loads(SEEN_FILE.read_text(encoding="utf-8"))
-    except Exception:
-        return {"links": []}
+def get_announcements():
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=LOOKBACK_HOURS)
+    announcements = []
 
+    for source, url in FEEDS:
+        try:
+            content = fetch_url(url)
+            items = parse_feed(source, content)
 
-def save_seen(links):
-    SEEN_FILE.write_text(
-        json.dumps({"links": sorted(set(links))}, indent=2),
-        encoding="utf-8",
+            for item in items:
+                # If the feed has no date, retain the item as a candidate.
+                if item["published"] is None or item["published"] >= cutoff:
+                    announcements.append(item)
+
+        except Exception as error:
+            print(f"[WARN] Could not read {source} feed: {error}")
+
+    # Newest dated announcements first.
+    announcements.sort(
+        key=lambda item: item["published"] or datetime.min.replace(
+            tzinfo=timezone.utc
+        ),
+        reverse=True,
     )
 
+    return announcements
 
-def discord_dm(message):
-    token = os.getenv("DISCORD_BOT_TOKEN", "").strip()
-    user_id = os.getenv("DISCORD_USER_ID", "").strip()
-    if not token or not user_id:
-        raise RuntimeError("Set DISCORD_BOT_TOKEN and DISCORD_USER_ID before sending.")
-    api = "https://discord.com/api/v10"
+
+def discord_request(endpoint, method="GET", payload=None):
+    url = "https://discord.com/api/v10" + endpoint
     headers = {
-        "Authorization": f"Bot {token}",
+        "Authorization": f"Bot {BOT_TOKEN}",
+        "User-Agent": DISCORD_AGENT,
         "Content-Type": "application/json",
     }
-    body = json.dumps({"recipient_id": user_id}).encode("utf-8")
-    request = urllib.request.Request(
-        f"{api}/users/@me/channels", data=body, headers=headers, method="POST"
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=25) as response:
-            channel = json.loads(response.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(
-            "Could not open a DM. Check the bot token, user ID, and that you and the bot "
-            f"share a Discord server. Discord said: {detail}"
-        ) from exc
 
-    chunks = [message[i:i + 1900] for i in range(0, len(message), 1900)] or ["No new items."]
-    for chunk in chunks:
-        payload = json.dumps({"content": chunk, "allowed_mentions": {"parse": []}}).encode("utf-8")
-        req = urllib.request.Request(
-            f"{api}/channels/{channel['id']}/messages",
-            data=payload,
-            headers=headers,
-            method="POST",
-        )
-        with urllib.request.urlopen(req, timeout=25) as response:
-            response.read()
+    body = None
+    if payload is not None:
+        body = json.dumps(payload).encode("utf-8")
+
+    request = urllib.request.Request(
+        url, data=body, headers=headers, method=method
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            data = response.read()
+            return json.loads(data) if data else {}
+    except urllib.error.HTTPError as error:
+        details = error.read().decode("utf-8", errors="replace")
+        print(f"[ERROR] Discord HTTP {error.code}: {details}")
+        raise
+
+
+def send_dm(message):
+    # Open or retrieve a DM channel, then send the message.
+    channel = discord_request(
+        "/users/@me/channels",
+        method="POST",
+        payload={"recipient_id": USER_ID},
+    )
+
+    channel_id = channel.get("id")
+    if not channel_id:
+        raise RuntimeError("Discord did not return a DM channel ID.")
+
+    discord_request(
+        f"/channels/{channel_id}/messages",
+        method="POST",
+        payload={"content": message[:2000]},
+    )
 
 
 def main():
-    dry_run = os.getenv("DRY_RUN", "false").lower() in {"1", "true", "yes"}
-    now = datetime.now(timezone.utc)
-    cutoff = now - timedelta(hours=LOOKBACK_HOURS)
-    seen = set(load_seen().get("links", []))
-    all_items = []
-    for source, url in FEEDS:
-        all_items.extend(parse_feed(source, url))
+    if not BOT_TOKEN or not USER_ID:
+        print("[ERROR] DISCORD_BOT_TOKEN or DISCORD_USER_ID is missing.")
+        sys.exit(1)
 
-    candidates = []
-    for item in all_items:
-        published = parse_date(item["published"])
-        if not published or published < cutoff or item["link"] in seen:
-            continue
-        searchable = f"{item['title']} {item['summary']}"
-        if INTEREST_WORDS.search(searchable):
-            candidates.append(item)
+    if not USER_ID.isdigit():
+        print("[ERROR] DISCORD_USER_ID must be your numeric Discord user ID.")
+        sys.exit(1)
 
-    candidates.sort(key=lambda item: item["published"], reverse=True)
-    candidates = candidates[:MAX_ITEMS]
+    seen = load_seen()
+    announcements = get_announcements()
 
-    if not candidates:
-        print("No new recent announcements matched the filters.")
-        # Mark older entries as seen too, so old items do not resurface later.
-        save_seen(seen | {item["link"] for item in all_items})
-        return
+    fresh = [
+        item for item in announcements
+        if item["link"] not in seen
+    ][:MAX_ITEMS]
 
-    lines = ["🤖 **FEATURE SCOUT — AI discoveries**", "Fresh announcements worth a look:\n"]
-    for item in candidates:
-        lines.append(f"**{item['source']}** · {item['title']}\n{item['link']}")
-        if item["summary"]:
-            lines.append(item["summary"][:220] + ("…" if len(item["summary"]) > 220 else ""))
-        lines.append("")
-    lines.append("Tip: announcements can roll out gradually, so a feature may not be available to every account yet.")
+    lines = [
+        "🤖 **ALEX — FEATURE SCOUT**",
+        "",
+        "Fresh AI announcements worth a look:",
+        "",
+    ]
 
-    message = "\n".join(lines)
-    print(message)
-    if not dry_run:
-        discord_dm(message)
-        print("Discord DM sent.")
+    if not fresh:
+        lines.append(
+            "No new announcements found in the monitored feeds today."
+        )
+    else:
+        for item in fresh:
+            lines.extend([
+                f"**{item['source']}** · {item['title']}",
+                item["link"],
+                "",
+            ])
 
-    # Store everything seen in the feeds so old entries do not repeat.
-    save_seen(seen | {item["link"] for item in all_items})
+    lines.extend([
+        "Tip: announcements can roll out gradually, so a feature may not "
+        "be available to every account yet."
+    ])
+
+    # Report the actual Discord error if the DM cannot be opened or sent.
+    try:
+        send_dm("\n".join(lines))
+        print(f"[OK] Sent a DM to Discord user ID {USER_ID}.")
+    except Exception as error:
+        print(f"[ERROR] Could not send Discord DM: {error}")
+        sys.exit(1)
+
+    for item in fresh:
+        seen.add(item["link"])
+
+    save_seen(seen)
+    print(f"[OK] Checked feeds; sent {len(fresh)} new announcement(s).")
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except Exception as exc:
-        print(f"[ERROR] {exc}", file=sys.stderr)
-        sys.exit(1)
+    main()
